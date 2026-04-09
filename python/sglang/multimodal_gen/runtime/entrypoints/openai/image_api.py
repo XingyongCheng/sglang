@@ -193,7 +193,6 @@ async def edits(
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
     url: Optional[List[str]] = Form(None),
     url_array: Optional[List[str]] = Form(None, alias="url[]"),
-    # for qwen-image-layer, dont need prompt
     # like DiffGenerator._resolve_prompts, use " " as default
     prompt: str = Form(" "),
     mask: Optional[UploadFile] = File(None),
