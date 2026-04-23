@@ -204,7 +204,7 @@ async def edits(
     url: Optional[List[str]] = Form(None),
     url_array: Optional[List[str]] = Form(None, alias="url[]"),
     # like DiffGenerator._resolve_prompts, use " " as default
-    prompt: str = Form(" "),
+    prompt: Optional[str] = Form(None),
     mask: Optional[UploadFile] = File(None),
     model: Optional[str] = Form(None),
     n: Optional[int] = Form(1),
