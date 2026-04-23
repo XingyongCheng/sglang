@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
+    has_fp8_weights_in_checkpoint,
     human_readable_int,
     is_blackwell_supported,
     is_cpu,
@@ -158,6 +159,13 @@ RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 DISAGG_TRANSFER_BACKEND_CHOICES = ["mooncake", "nixl", "ascend", "fake", "mori"]
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
+
+# Placeholder token inserted between items in Multi-Item Scoring sequences:
+# query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
+# lengths (multi_item_delimiter_indices); the token only exists for FlashInfer
+# attention mask compat and logprob column indexing. Will be removed once the
+# attention backend supports position-only MIS.
+MIS_DELIMITER_TOKEN_ID = 9999
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -372,6 +380,7 @@ class ServerArgs:
     pp_max_micro_batch_size: Optional[int] = None
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
+    batch_notify_size: int = 16
     stream_response_default_include_usage: bool = False
     incremental_streaming_output: bool = False
     enable_streaming_session: bool = False
@@ -402,7 +411,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
-    metrics_http_port: Optional[int] = None
+    grpc_http_sidecar_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
@@ -436,6 +445,7 @@ class ServerArgs:
     file_storage_path: str = "sglang_storage"
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
+    strip_thinking_cache: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
@@ -529,6 +539,7 @@ class ServerArgs:
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
+    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -601,10 +612,11 @@ class ServerArgs:
     offload_mode: str = "cpu"
 
     # Scoring configuration
-    # Delimiter token ID used to combine Query and Items into a single sequence for multi-item scoring.
-    # Format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
-    # This enables efficient batch processing of multiple items against a single query.
-    multi_item_scoring_delimiter: Optional[Union[int]] = None
+    # Enable Multi-Item Scoring optimization. Combines query and multiple items
+    # into a single sequence for efficient batch processing. Item boundaries are
+    # determined by pre-computed delimiter indices (from item lengths), not by the
+    # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
+    enable_mis: bool = False
 
     # Optimization/debug options
     disable_radix_cache: bool = False
@@ -800,9 +812,6 @@ class ServerArgs:
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
 
-        # Handle multi-item scoring constraints.
-        self._handle_multi_item_scoring()
-
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
 
@@ -822,6 +831,10 @@ class ServerArgs:
         self._handle_amd_specifics()
         self._handle_nccl_pre_warm()
         self._handle_grammar_backend()
+
+        # Handle multi-item scoring constraints. Must run after the above so
+        # the final attention backend and chunked_prefill_size are in effect.
+        self._handle_multi_item_scoring()
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -1227,19 +1240,35 @@ class ServerArgs:
             self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
-        """Disable CUDA graphs when multi-item scoring delimiter is set.
+        """Setup and validate multi-item scoring constraints.
 
-        The padded static input_ids buffer used by CUDA graph replay causes
-        spurious delimiter matches in score_and_pool's MIS path.
+        Auto-disables settings incompatible with MIS mechanics (CUDA graph,
+        radix cache, chunked prefill). Asserts on attention backend since
+        changing it silently could surprise users who intentionally picked
+        a non-flashinfer backend.
         """
-        if self.multi_item_scoring_delimiter is None:
+        if not self.enable_mis:
             return
+
         if not self.disable_cuda_graph:
-            logger.warning(
-                "CUDA graph is disabled because --multi-item-scoring-delimiter is set."
-            )
+            logger.warning("CUDA graph is disabled because --enable-mis is set.")
             self.disable_cuda_graph = True
         self.disable_piecewise_cuda_graph = True
+
+        if not self.disable_radix_cache:
+            logger.warning("Radix cache is disabled because --enable-mis is set.")
+            self.disable_radix_cache = True
+
+        if self.chunked_prefill_size != -1:
+            logger.warning("Chunked prefill is disabled because --enable-mis is set.")
+            self.chunked_prefill_size = -1
+
+        prefill_backend, decode_backend = self.get_attention_backends()
+        assert prefill_backend == "flashinfer" and decode_backend == "flashinfer", (
+            "Multi-item scoring requires flashinfer attention backend for custom attention mask support. "
+            f"Please set --attention-backend flashinfer when using --enable-mis. "
+            f"Current backends: prefill={prefill_backend}, decode={decode_backend}"
+        )
 
     def _handle_gpu_memory_settings(self, gpu_mem):
         """
@@ -1744,14 +1773,23 @@ class ServerArgs:
                     self.quantization is None
                     and not self._quantization_explicitly_unset
                 ):
-                    # Default DeepSeek V3/R1 native FP8 when not explicitly set,
-                    # Because we need this condition for an assertion in
-                    # flashinfer_trtllm MoE runner backend.
+                    # DeepSeek V3/R1 uses native FP8 MoE experts without
+                    # declaring it in quantization_config.  However, other
+                    # models that share the same architecture class (e.g.
+                    # Moonlight-16B-A3B) are purely BF16.  Check the actual
+                    # safetensors header instead of assuming FP8 by arch name.
                     if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                        self.quantization = "fp8"
-                        logger.info(
-                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
-                        )
+                        if has_fp8_weights_in_checkpoint(self.model_path):
+                            self.quantization = "fp8"
+                            logger.info(
+                                "Detected FP8 expert weights in checkpoint, "
+                                "default to fp8 for DeepSeek on sm100"
+                            )
+                        else:
+                            logger.info(
+                                "No FP8 expert weights found in checkpoint, "
+                                "keeping bf16 for DeepSeek-arch model on sm100"
+                            )
                     else:
                         self.quantization = quant_method
                 if (
@@ -2396,7 +2434,10 @@ class ServerArgs:
             elif is_mps():
                 return "torch_native"
             else:
-                return "flashinfer" if is_flashinfer_available() else "triton"
+                # FlashInfer does not support attention sinks.
+                if is_flashinfer_available() and not model_config.has_attention_sinks:
+                    return "flashinfer"
+                return "triton"
         else:
             # MLA architecture
             if is_hopper_with_cuda_12_3():
@@ -3135,9 +3176,14 @@ class ServerArgs:
 
         # If decode backend is implicit, pick a safe backend without changing io backend.
         if not self.use_mla_backend():
-            self.decode_attention_backend = (
-                "flashinfer" if is_flashinfer_available() else "triton"
-            )
+            # FlashInfer does not support attention sinks.
+            if (
+                is_flashinfer_available()
+                and not self.get_model_config().has_attention_sinks
+            ):
+                self.decode_attention_backend = "flashinfer"
+            else:
+                self.decode_attention_backend = "triton"
         else:
             self.decode_attention_backend = (
                 "flashinfer" if is_sm100_supported() else "triton"
@@ -3468,18 +3514,15 @@ class ServerArgs:
                 )
 
         if self.speculative_adaptive:
-            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+            from sglang.srt.speculative.adaptive_spec_params import (
+                adaptive_unsupported_reason,
+            )
+
+            reason = adaptive_unsupported_reason(self)
+            if reason is not None:
                 logger.warning(
-                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
-                    f"Current algorithm={self.speculative_algorithm}. "
-                    "Falling back to static params."
-                )
-                self.speculative_adaptive = False
-            elif self.speculative_eagle_topk != 1:
-                logger.warning(
-                    "speculative_adaptive is only supported with topk=1. "
-                    f"Current topk={self.speculative_eagle_topk}. "
-                    "Falling back to static params."
+                    f"speculative_adaptive disabled: {reason}. "
+                    "Falling back to static speculative params."
                 )
                 self.speculative_adaptive = False
 
@@ -4512,6 +4555,13 @@ class ServerArgs:
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
+            "--batch-notify-size",
+            type=int,
+            default=ServerArgs.batch_notify_size,
+            help="Number of streaming notifications to batch before yielding to the event loop. "
+            "Reduces asyncio wakeup overhead under high concurrency.",
+        )
+        parser.add_argument(
             "--incremental-streaming-output",
             action="store_true",
             help="Whether to output as a sequence of disjoint segments.",
@@ -4677,12 +4727,12 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
-            "--metrics-http-port",
+            "--grpc-http-sidecar-port",
             type=int,
-            default=ServerArgs.metrics_http_port,
-            help="Port for the Prometheus metrics HTTP server. "
-            "Only used in gRPC mode (--grpc-mode); in HTTP mode, metrics are served on the main --port. "
-            "Defaults to --port + 1 when --enable-metrics is set.",
+            default=ServerArgs.grpc_http_sidecar_port,
+            help="Port for the HTTP sidecar server in gRPC mode (--grpc-mode). "
+            "Serves Prometheus metrics and profiling endpoints. "
+            "Defaults to --port + 1. Not used in HTTP mode.",
         )
         parser.add_argument(
             "--enable-mfu-metrics",
@@ -4878,6 +4928,13 @@ class ServerArgs:
             choices=list(ReasoningParser.DetectorMap.keys()),
             default=ServerArgs.reasoning_parser,
             help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+        )
+        parser.add_argument(
+            "--strip-thinking-cache",
+            action="store_true",
+            help="Skip caching reasoning-model output (thinking + answer) in the "
+            "radix tree on finish; keep only the prompt prefix. Opt-in: changes "
+            "cache contents.",
         )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
@@ -5362,6 +5419,14 @@ class ServerArgs:
             help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
+            "--record-nolora-graph",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.record_nolora_graph,
+            help="Capture a second set of CUDA graphs without LoRA hooks. "
+            "Batches without active adapters replay the faster nolora graph. "
+            "Enabled by default.",
+        )
+        parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
             choices=["default", "bf16"],
@@ -5739,10 +5804,13 @@ class ServerArgs:
 
         # Args for multi-item-scoring
         parser.add_argument(
-            "--multi-item-scoring-delimiter",
-            type=int,
-            default=ServerArgs.multi_item_scoring_delimiter,
-            help="Delimiter token ID for multi-item scoring. Used to combine Query and Items into a single sequence: Query<delimiter>Item1<delimiter>Item2<delimiter>... This enables efficient batch processing of multiple items against a single query.",
+            "--enable-mis",
+            action="store_true",
+            default=ServerArgs.enable_mis,
+            help="Enable Multi-Item Scoring optimization. Combines query and multiple items "
+            "into a single sequence for efficient batch processing. "
+            "Requires --attention-backend flashinfer; auto-disables CUDA graph, "
+            "radix cache, and chunked prefill.",
         )
 
         # Optimization/debug options
@@ -6611,17 +6679,6 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
-
-        # Check multi-item scoring
-        if self.multi_item_scoring_delimiter is not None:
-            assert self.disable_radix_cache, (
-                "Multi-item scoring requires radix cache to be disabled. "
-                "Please set --disable-radix-cache when using --multi-item-scoring-delimiter."
-            )
-            assert self.chunked_prefill_size == -1, (
-                "Multi-item scoring requires chunked prefill to be disabled. "
-                "Please set --chunked-prefill-size -1 when using --multi-item-scoring-delimiter."
-            )
 
         # Check hisparse
         if self.enable_hisparse:
